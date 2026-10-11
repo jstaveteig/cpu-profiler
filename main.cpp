@@ -22,7 +22,12 @@
 volatile std::sig_atomic_t stopRequested = 0;
 static unsigned long long eventCount = 0;
 
-using traceEvent = std::variant<schedEvent, wakeEvent>;
+using TraceEvent = std::variant<
+    schedEvent,
+    wakeEvent,
+    ForkEvent,
+    ExitEvent
+>;
 
 struct Recording {
     std::vector<traceEvent> events;
@@ -41,47 +46,45 @@ static int handle_event(void* ctx, void* data, size_t data_sz) {
     std::memcpy(&header, data, sizeof(header));
     ++eventCount;
 
+    auto storeEvent = [&]<typename T>() -> int {
+        if (data_sz != sizeof(T)) {
+            std::cerr << "Error: Unexpected record size recieved! "
+                    << "Expected " << sizeof(T) << "bytes, "
+                    << "but got " << data_sz << " bytes." << std::endl;
+            return -EINVAL;
+        }
+        T event{};
+        std::memcpy(&event, data, sizeof(T));
+        if (recording->events.size() >= recording->events.capacity()) {
+            return -ENOSPC;
+        }
+        recording->events.emplace_back(event);
+
+        return 0;
+    }
 
     switch (header.type) {
         case EVENT_SWITCH: {
-            if (data_sz != sizeof(struct schedEvent)) {
-                std::cerr << "Error: Unexpected record size recieved! "
-                        << "Expected " << sizeof(struct schedEvent) << "bytes, "
-                        << "but got " << data_sz << " bytes." << std::endl;
-                return -EINVAL;
-            }
-            schedEvent event{};
-            std::memcpy(&event, data, sizeof(schedEvent));
-            if (recording->events.size() >= recording->events.capacity()) {
-                return -ENOSPC;
-            }
-            recording->events.emplace_back(event);
-            break;
+            storeEvent.operator()<schedEvent>();
         }
 
         case EVENT_WAKING:
         case EVENT_WAKEUP: {
-            if (data_sz != sizeof(struct wakeEvent)) {
-                std::cerr << "Error: Unexpected record size recieved! "
-                        << "Expected " << sizeof(struct wakeEvent) << "bytes, "
-                        << "but got " << data_sz << " bytes." << std::endl;
-                return -EINVAL;
-            }
-            wakeEvent event{};
-            std::memcpy(&event, data, sizeof(wakeEvent));
-            if (recording->events.size() >= recording->events.capacity()) {
-                return -ENOSPC;
-            }
-            recording->events.emplace_back(event);
-            break;
+            storeEvent.operator()<wakeEvent>();
         }
+        case EVENT_FORK: {
+            storeEvent.operator()<forkEvent>();
+        }
+        case EVENT_EXIT: {
+            storeEvent.operator()<exitEvent>();
+        }
+
+
         default: {
             std::cerr << "Error: Unexpected record type recieved! " << std::endl;
             return -EINVAL;
         }
     }
-
-    return 0;
 }
 
 void handleSignInt(int signal) {

@@ -35,6 +35,24 @@ wakeEvent makeWake(std::uint64_t time_ms, std::uint32_t type) {
     return event;
 }
 
+forkEvent makeFork(uint64_t time_ms, int32_t parent, int32_t child) {
+    forkEvent event{};
+    event.header.type = EVENT_FORK;
+    event.header.timestamp_ns = time_ms * ms;
+    event.parent_tid = parent;
+    event.child_tid = child;
+    return event;
+}
+
+exitEvent makeExit(uint64_t time_ms, int32_t tid) {
+    exitEvent event{};
+    event.header.type = EVENT_EXIT;
+    event.header.timestamp_ns = time_ms * ms;
+    event.tid = tid;
+    return event;
+}
+
+
 void expectInterval(const std::vector<Interval>& intervals,
                     threadState state, std::uint64_t start_ms,
                     std::uint64_t end_ms) {
@@ -63,7 +81,6 @@ void expectCount(const std::vector<Interval>& intervals, std::size_t expected) {
 }
 
 void testNormalWaitAndOrdering() {
-    // Deliberately unordered input: reconstruction must sort by timestamp.
     std::vector<traceEvent> events{
         makeSwitch(328, 0, worker),          // Worker starts running again.
         makeWake(310, EVENT_WAKEUP),         // Repeated wakeup: must not reset 300.
@@ -71,6 +88,7 @@ void testNormalWaitAndOrdering() {
         makeWake(290, EVENT_WAKING),         // Initiation alone changes no state.
         makeSwitch(100, 0, worker),          // Worker starts running.
         makeWake(300, EVENT_WAKEUP),         // Worker becomes runnable.
+
     };
 
     const auto intervals = reconstruct(events);
@@ -79,6 +97,61 @@ void testNormalWaitAndOrdering() {
     expectInterval(intervals, threadState::Sleeping, 120, 300);
     expectInterval(intervals, threadState::Runnable, 300, 328);
     std::cout << "PASS: running, sleeping, runnable, ordering, repeated wakeup\n";
+}
+
+void testForkExitTidReuse() {
+    std::vector<traceEvent> events{
+        makeFork(100, 100, 450),
+        makeSwitch(110, 0, 450),
+        makeExit(150, 450),
+        makeSwitch(155, 450, 0),
+
+        makeFork(300, 100, 450),
+        makeSwitch(320, 0, 450),
+        makeSwitch(350, 450, 0)
+    };
+
+    auto intervals = reconstruct(events);
+
+    const Interval* first = nullptr;
+    const Interval* second = nullptr;
+
+    for (const auto& interval : intervals) {
+        if (interval.tid != 450) {
+            continue;
+        }
+
+        if (interval.start_ns < 300 * ms &&
+            interval.end_ns > 155 * ms) {
+            throw std::runtime_error("Interval crosses thread lifetimes");
+        }
+
+        if (interval.state != threadState::Running) {
+            continue;
+        }
+
+        if (interval.start_ns == 110 * ms &&
+            interval.end_ns == 155 * ms) {
+            first = &interval;
+        }
+
+        if (interval.start_ns == 320 * ms &&
+            interval.end_ns == 350 * ms) {
+            second = &interval;
+        }
+    }
+
+    if (!first || !second) {
+        throw std::runtime_error("Missing expected running intervals");
+    }
+
+    if (first->lifetime_id == 0 ||
+        second->lifetime_id == 0 ||
+        first->lifetime_id == second->lifetime_id) {
+        throw std::runtime_error("Thread lifetimes were not separated");
+    }
+
+    std::cout << "PASS: fork, exit, and TID reuse\n";
 }
 
 void testMissingWakeup() {
@@ -100,6 +173,7 @@ int main() {
     try {
         testNormalWaitAndOrdering();
         testMissingWakeup();
+        testForkExitTidReuse();
         std::cout << "All reconstruction tests passed.\n";
         return 0;
     } catch (const std::exception& error) {

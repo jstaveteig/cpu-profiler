@@ -4,7 +4,7 @@
 enum eventType {
     EVENT_SWITCH = 1,
     EVENT_WAKING = 2,
-    EVENT_WAKEUP = 3
+    EVENT_WAKEUP = 3,
     EVENT_FORK = 4,
     EVENT_EXIT = 5
 };

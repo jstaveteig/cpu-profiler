@@ -5,7 +5,12 @@
 #include <vector>
 #include "events.h"
 
-using traceEvent = std::variant<schedEvent, wakeEvent>;
+using traceEvent = std::variant<
+    schedEvent,
+    wakeEvent,
+    forkEvent,
+    exitEvent
+>;
 
 enum class threadState {
     Running,
@@ -21,6 +26,7 @@ struct Interval {
     uint64_t end_ns;
     threadState state;
     int32_t cpu = -1;
+    uint64_t lifetime_id = 0;
 };
 
 std::vector<Interval> reconstruct(

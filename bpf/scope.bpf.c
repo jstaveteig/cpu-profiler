@@ -105,22 +105,61 @@ int handle_sched_fork(  struct trace_event_raw_sched_process_fork *ctx ) {
     if (!bpf_map_lookup_elem(&tracked_tids, &parent) ) {
         return 0;
     }
+    struct forkEvent *e;
+    e = bpf_ringbuf_reserve(&events, sizeof(struct forkEvent), 0);
+
     __u32 child = ctx->child_pid;
     __u8 value = 1;
-    struct wakeEvent *e;
-    e = bpf_ringbuf_reserve(&events, sizeof(struct wakeEvent), 0);
-    if (!e) {forkEvent
-        return 0;
-    }
-
-
 
     int ret = bpf_map_update_elem(&tracked_tids, &child, &value, BPF_ANY);
     if( ret < 0 ) { // kinda redundant for now
         return 0;
     }
+
+    if (!e) {
+        return 0;
+    }
+
+    e->header.type = EVENT_FORK;
+    e->header.timestamp_ns = bpf_ktime_get_ns();
+    e->header.reserved = 0;
+    e->parent_tid = ctx->parent_pid;
+    e->child_tid = ctx->child_pid;
+    
+    bpf_ringbuf_submit(e, 0);
+
     return 0;
 }
 
+SEC("tracepoint/sched/sched_process_exit")
+int handle_sched_exit(  struct trace_event_raw_sched_process_template *ctx ) {
+    __u32 tid = ctx->pid;
+    if (!bpf_map_lookup_elem(&tracked_tids, &tid) ) {
+        return 0;
+    }
+    struct exitEvent *e;
+    e = bpf_ringbuf_reserve(&events, sizeof(struct exitEvent), 0);
+    if (!e) {
+        return 0;
+    }
+
+    e->header.type = EVENT_EXIT;
+    e->header.timestamp_ns = bpf_ktime_get_ns();
+    e->header.reserved = 0;
+    e->tid = ctx->pid;
+    e->reserved = 0;
+    
+    bpf_ringbuf_submit(e, 0);
+
+    return 0;
+}
+
+SEC("tracepoint/sched/sched_process_free")
+int handle_sched_free(  struct trace_event_raw_sched_process_template *ctx ) {
+    __u32 tid = ctx->pid;
+    bpf_map_delete_elem(&tracked_tids, &tid);
+
+    return 0;
+}
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";

@@ -7,6 +7,8 @@ struct activeThread {
     threadState state;
     uint64_t since_ns;
     int32_t cpu;
+    uint64_t lifetime_id = 0;
+    bool exiting = false;
 };
 
 enum class TransitionSource {
@@ -53,6 +55,7 @@ std::vector<Interval> reconstruct(
 
     std::unordered_map<int32_t, activeThread> active;
     std::vector<Interval> intervals;
+    uint64_t nextLifetimeId = 1;
 
     size_t inconsistencies = 0;
     size_t repeated = 0;
@@ -74,12 +77,17 @@ std::vector<Interval> reconstruct(
             return;
         }
 
-        auto [it, inserted] = active.try_emplace(
-            tid,
-            activeThread{newState, timestamp, cpu}
-        );
+        auto it = active.find(tid);
 
-        if (inserted) {
+        if (it == active.end()) {
+            active.emplace(tid, activeThread{
+                newState,
+                timestamp,
+                cpu,
+                nextLifetimeId++,
+                false
+            });
+
             return;
         }
 
@@ -90,9 +98,12 @@ std::vector<Interval> reconstruct(
             return;
         }
 
-        if (previous.state == newState &&
-            (newState != threadState::Running ||
-            previous.cpu == cpu)) {
+        bool finalSwitchOut =
+            source == TransitionSource::SwitchOut && previous.exiting;
+
+        if (!finalSwitchOut &&
+            previous.state == newState &&
+            (newState != threadState::Running || previous.cpu == cpu)) {
 
             ++repeated;
             return;
@@ -128,26 +139,31 @@ std::vector<Interval> reconstruct(
                 previous.since_ns,
                 timestamp,
                 valid ? previous.state : threadState::Unknown,
-                valid ? previous.cpu : -1
+                valid ? previous.cpu : -1,
+                previous.lifetime_id
             });
-        }
+        }   
 
         if (!valid) {
             ++inconsistencies;
         }
 
+        if (finalSwitchOut) {
+            active.erase(it);
+            return;
+        }
+
         previous = activeThread{
             newState,
             timestamp,
-            cpu
+            cpu,
+            previous.lifetime_id,
+            previous.exiting
         };
     };
 
     for (const auto& event : sortedEvents) {
         if( const auto* sw = std::get_if<schedEvent>(&event)) {
-            if (!sw) {
-                continue;
-            }
             uint64_t timestamp = sw->header.timestamp_ns;
             transition(
                 sw->prev_tid,
@@ -165,9 +181,6 @@ std::vector<Interval> reconstruct(
                 TransitionSource::SwitchIn
             );
         } else if ( const auto* wake = std::get_if<wakeEvent>(&event)) {
-            if (!wake) {
-                continue;
-            }
             if (wake->header.type == EVENT_WAKEUP) {
                 transition(
                     wake->target_tid,
@@ -176,6 +189,31 @@ std::vector<Interval> reconstruct(
                     -1,
                     TransitionSource::Wakeup
                 );
+            }
+        } else if ( const auto* fork = std::get_if<forkEvent>(&event)) {
+            int32_t tid = fork->child_tid;
+
+            if (tid <= 0) {
+                continue;
+            }
+
+            if (active.contains(tid)) {
+                ++inconsistencies;
+                active.erase(tid);
+            }
+
+            active.emplace(tid, activeThread{
+                threadState::Unknown,
+                fork->header.timestamp_ns,
+                -1,
+                nextLifetimeId++,
+                false
+            });
+        } else if (const auto* exited = std::get_if<exitEvent>(&event)) {
+            auto it = active.find(exited->tid);
+
+            if (it != active.end()) {
+                it->second.exiting = true;
             }
         }
     }
