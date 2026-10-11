@@ -7,8 +7,22 @@ struct {
     __uint(max_entries, 256 * 1024);
 } events SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1684);
+    __type(key, __u32);
+    __type(value, __u8);
+} tracked_tids SEC(".maps");
+
 SEC("tracepoint/sched/sched_switch")
 int handle_sched_switch( struct trace_event_raw_sched_switch *ctx ) {
+    __u32 prev = ctx->prev_pid;
+    __u32 next = ctx->next_pid;
+    if (!bpf_map_lookup_elem(&tracked_tids, &prev) ||
+        !bpf_map_lookup_elem(&tracked_tids, &next) ) {
+        return 0;
+    }
+
     struct schedEvent *e;
 
     e = bpf_ringbuf_reserve(&events, sizeof(struct schedEvent), 0);
@@ -31,6 +45,11 @@ int handle_sched_switch( struct trace_event_raw_sched_switch *ctx ) {
 
 SEC("tracepoint/sched/sched_waking")
 int handle_sched_waking( struct trace_event_raw_sched_wakeup_template *ctx ) {
+    __u32 target = ctx->pid;
+    if (!bpf_map_lookup_elem(&tracked_tids, &target) ) {
+        return 0;
+    }
+
     struct wakeEvent *e;
 
     e = bpf_ringbuf_reserve(&events, sizeof(struct wakeEvent), 0);
@@ -55,8 +74,11 @@ int handle_sched_waking( struct trace_event_raw_sched_wakeup_template *ctx ) {
 
 SEC("tracepoint/sched/sched_wakeup")
 int handle_sched_wakeup( struct trace_event_raw_sched_wakeup_template *ctx ) {
+    __u32 target = ctx->pid;
+    if (!bpf_map_lookup_elem(&tracked_tids, &target) ) {
+        return 0;
+    }
     struct wakeEvent *e;
-
     e = bpf_ringbuf_reserve(&events, sizeof(struct wakeEvent), 0);
     if (!e) {
         return 0;
@@ -74,6 +96,21 @@ int handle_sched_wakeup( struct trace_event_raw_sched_wakeup_template *ctx ) {
     e->target_cpu = ctx->target_cpu;
 
     bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+SEC("tracepoint/sched/sched_process_fork")
+int handle_sched_fork(  struct trace_event_raw_sched_process_fork *ctx ) {
+    __u32 parent = ctx->parent_pid;
+    if (!bpf_map_lookup_elem(&tracked_tids, &parent) ) {
+        return 0;
+    }
+    __u32 child = ctx->child_pid;
+    __u8 value = 1;
+    int ret = bpf_map_update_elem(&tracked_tids, &child, &value, BPF_ANY);
+    if( ret < 0 ) { // kinda redundant for now
+        return 0;
+    }
     return 0;
 }
 
