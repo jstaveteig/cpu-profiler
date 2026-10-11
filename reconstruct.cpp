@@ -182,7 +182,7 @@ std::vector<Interval> reconstruct(
             );
         } else if ( const auto* wake = std::get_if<wakeEvent>(&event)) {
             if (wake->header.type == EVENT_WAKEUP ||
-            wake->header.type == EVENT_WAKEUP_NEW)
+            wake->header.type == EVENT_WAKEUP_NEW) {
                 transition(
                     wake->target_tid,
                     threadState::Runnable,
