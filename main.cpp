@@ -8,22 +8,63 @@
 #include "scope.skel.h"
 
 volatile std::sig_atomic_t stopRequested = 0;
+static unsigned long long eventCount = 0;
+
 
 static int handle_event(void* ctx, void* data, size_t data_sz) {
-    if (data_sz != sizeof(struct schedEvent)) {
-        std::cerr << "Error: Unexpected record size recieved! "
-                 << "Expected " << sizeof(struct schedEvent) << "bytes, "
-                 << "but got " << data_sz << " bytes." << std::endl;
+    if (stopRequested) {
+        return -EINTR;
+    }
+    if (data_sz < sizeof(eventHeader)) {
+        std::cerr << "Event is too small" << std::endl;
         return -EINVAL;
     }
 
-    schedEvent event{};
+    eventHeader header{};
+    std::memcpy(&header, data, sizeof(header));
+    ++eventCount;
 
-    std::memcpy(&event, data, sizeof(schedEvent));
 
-    std::cout << "Successfully copied event! Prev PID: " << event.prev_tid 
-              << ", Next PID: " << event.next_tid 
-              << ", State: " << event.prev_state << std::endl;
+    switch (header.type) {
+        case EVENT_SWITCH: {
+            if (data_sz != sizeof(struct schedEvent)) {
+                std::cerr << "Error: Unexpected record size recieved! "
+                        << "Expected " << sizeof(struct schedEvent) << "bytes, "
+                        << "but got " << data_sz << " bytes." << std::endl;
+                return -EINVAL;
+            }
+            schedEvent event{};
+            std::memcpy(&event, data, sizeof(schedEvent));
+            if ( eventCount % 1000 == 0 ) {
+                std::cout << "SWITCH: "
+                        << event.prev_tid << " -> "
+                        << event.next_tid << std::endl;
+            }
+            break;
+        }
+
+        case EVENT_WAKING:
+        case EVENT_WAKEUP: {
+            if (data_sz != sizeof(struct wakeEvent)) {
+                std::cerr << "Error: Unexpected record size recieved! "
+                        << "Expected " << sizeof(struct wakeEvent) << "bytes, "
+                        << "but got " << data_sz << " bytes." << std::endl;
+                return -EINVAL;
+            }
+            wakeEvent event{};
+            std::memcpy(&event, data, sizeof(wakeEvent));
+            if ( eventCount % 1000 == 0 ) {
+                std::cout << (header.type == EVENT_WAKING ? "WAKING" : "WAKEUP")
+                        << ": Target " << event.target_tid
+                        << ", Current " << event.current_tid << std::endl;
+            }
+            break;
+        }
+        default: {
+            std::cerr << "Error: Unexpected record type recieved! " << std::endl;
+            return -EINVAL;
+        }
+    }
 
     return 0;
 }
