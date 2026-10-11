@@ -19,10 +19,10 @@ struct Interval {
     int32_t tid;
     uint64_t start_ns;
     uint64_t end_ns;
-    ThreadState state;
+    threadState state;
     int32_t cpu = -1;
 };
 
 std::vector<Interval> reconstruct(
-    const std::vector<TraceEvent>& events
+    const std::vector<traceEvent>& events
 );

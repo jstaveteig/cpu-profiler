@@ -107,6 +107,14 @@ int handle_sched_fork(  struct trace_event_raw_sched_process_fork *ctx ) {
     }
     __u32 child = ctx->child_pid;
     __u8 value = 1;
+    struct wakeEvent *e;
+    e = bpf_ringbuf_reserve(&events, sizeof(struct wakeEvent), 0);
+    if (!e) {forkEvent
+        return 0;
+    }
+
+
+
     int ret = bpf_map_update_elem(&tracked_tids, &child, &value, BPF_ANY);
     if( ret < 0 ) { // kinda redundant for now
         return 0;

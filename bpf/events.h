@@ -5,6 +5,8 @@ enum eventType {
     EVENT_SWITCH = 1,
     EVENT_WAKING = 2,
     EVENT_WAKEUP = 3
+    EVENT_FORK = 4,
+    EVENT_EXIT = 5
 };
 
 struct eventHeader {
@@ -29,6 +31,18 @@ struct wakeEvent {
     int32_t current_tid;
     uint32_t cpu;
     uint32_t target_cpu;
+};
+
+struct forkEvent {
+    struct eventHeader header;
+    int32_t parent_tid;
+    int32_t child_tid;
+};
+
+struct exitEvent {
+    struct eventHeader header;
+    int32_t tid;
+    int32_t reserved;
 };
 
 #endif

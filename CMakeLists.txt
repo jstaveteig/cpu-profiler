@@ -73,3 +73,17 @@ target_include_directories(scope PRIVATE
 )
 
 target_link_libraries(scope PRIVATE PkgConfig::LIBBPF)
+
+enable_testing()
+
+add_executable(reconstruct_test
+    tests/reconstruct_test.cpp
+    reconstruct.cpp
+)
+
+target_include_directories(reconstruct_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/bpf"
+)
+
+add_test(NAME reconstruction COMMAND reconstruct_test)
