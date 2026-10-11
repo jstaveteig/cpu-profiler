@@ -1,5 +1,5 @@
 #include "recording.hpp"
-
+#include <initializer_list>
 #include <sqlite3.h>
 #include <stdexcept>
 #include <type_traits>
@@ -131,4 +131,122 @@ void saveRecording(
     }
 
     sqlite3_close(db);
+}
+
+
+std::vector<traceEvent> loadRecording(const std::string& path) {
+    sqlite3* db = nullptr;
+
+    if (sqlite3_open_v2(
+            path.c_str(), &db, SQLITE_OPEN_READONLY, nullptr
+        ) != SQLITE_OK) {
+        std::string error = db ? sqlite3_errmsg(db) : "Cannot open recording";
+        sqlite3_close(db);
+        throw std::runtime_error(error);
+    }
+
+    sqlite3_stmt* stmt = nullptr;
+    std::vector<traceEvent> events;
+
+    try {
+        const char* sql = R"(
+            SELECT
+                type, timestamp_ns,
+                prev_tid, next_tid, prev_state, cpu,
+                target_tid, current_tid, target_cpu,
+                parent_tid, child_tid, tid
+            FROM events
+            ORDER BY seq;
+        )";
+
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+            throw std::runtime_error(sqlite3_errmsg(db));
+        }
+
+        int result;
+
+        while ((result = sqlite3_step(stmt)) == SQLITE_ROW) {
+            int type = sqlite3_column_int(stmt, 0);
+            uint64_t timestamp =
+                static_cast<uint64_t>(sqlite3_column_int64(stmt, 1));
+
+            // Reject records missing fields required by their type.
+            auto requireColumns = [&](std::initializer_list<int> columns) {
+                for (int column : columns) {
+                    if (sqlite3_column_type(stmt, column) == SQLITE_NULL) {
+                        throw std::runtime_error("Missing required event field");
+                    }
+                }
+            };
+
+            switch (type) {
+                case EVENT_SWITCH: {
+                    requireColumns({2, 3, 4, 5});
+                    schedEvent e{};
+                    e.header.type = type;
+                    e.header.timestamp_ns = timestamp;
+                    e.prev_tid = sqlite3_column_int(stmt, 2);
+                    e.next_tid = sqlite3_column_int(stmt, 3);
+                    e.prev_state = sqlite3_column_int64(stmt, 4);
+                    e.cpu = sqlite3_column_int(stmt, 5);
+                    events.emplace_back(e);
+                    break;
+                }
+
+                case EVENT_WAKING:
+                case EVENT_WAKEUP:
+                case EVENT_WAKEUP_NEW: {
+                    requireColumns({5, 6, 7, 8});
+                    wakeEvent e{};
+                    e.header.type = type;
+                    e.header.timestamp_ns = timestamp;
+                    e.cpu = sqlite3_column_int(stmt, 5);
+                    e.target_tid = sqlite3_column_int(stmt, 6);
+                    e.current_tid = sqlite3_column_int(stmt, 7);
+                    e.target_cpu = sqlite3_column_int(stmt, 8);
+                    events.emplace_back(e);
+                    break;
+                }
+
+                case EVENT_FORK: {
+                    requireColumns({9, 10});
+                    forkEvent e{};
+                    e.header.type = type;
+                    e.header.timestamp_ns = timestamp;
+                    e.parent_tid = sqlite3_column_int(stmt, 9);
+                    e.child_tid = sqlite3_column_int(stmt, 10);
+                    events.emplace_back(e);
+                    break;
+                }
+
+                case EVENT_EXIT: {
+                    requireColumns({11});
+                    exitEvent e{};
+                    e.header.type = type;
+                    e.header.timestamp_ns = timestamp;
+                    e.tid = sqlite3_column_int(stmt, 11);
+                    events.emplace_back(e);
+                    break;
+                }
+
+                default:
+                    throw std::runtime_error("Unknown recording event type");
+            }
+        }
+
+        if (result != SQLITE_DONE) {
+            throw std::runtime_error(sqlite3_errmsg(db));
+        }
+
+        sqlite3_finalize(stmt);
+        stmt = nullptr;
+        sqlite3_close(db);
+
+        return events;
+
+    } catch (...) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        throw;
+    }
 }

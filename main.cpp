@@ -15,13 +15,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include "events.h"
 #include "recording.hpp"
 
 #include "scope.skel.h"
 
 volatile std::sig_atomic_t stopRequested = 0;
-static unsigned long long eventCount = 0;
 
 using traceEvent = std::variant<
     schedEvent,
@@ -45,7 +45,6 @@ static int handle_event(void* ctx, void* data, size_t data_sz) {
 
     eventHeader header{};
     std::memcpy(&header, data, sizeof(header));
-    ++eventCount;
 
     auto storeEvent = [&]<typename T>() -> int {
         if (data_sz != sizeof(T)) {
@@ -66,18 +65,19 @@ static int handle_event(void* ctx, void* data, size_t data_sz) {
 
     switch (header.type) {
         case EVENT_SWITCH: {
-            storeEvent.operator()<schedEvent>();
+            return storeEvent.operator()<schedEvent>();
         }
 
         case EVENT_WAKING:
-        case EVENT_WAKEUP: {
-            storeEvent.operator()<wakeEvent>();
+        case EVENT_WAKEUP:
+        case EVENT_WAKEUP_NEW: {
+            return storeEvent.operator()<wakeEvent>();
         }
         case EVENT_FORK: {
-            storeEvent.operator()<forkEvent>();
+            return storeEvent.operator()<forkEvent>();
         }
         case EVENT_EXIT: {
-            storeEvent.operator()<exitEvent>();
+            return storeEvent.operator()<exitEvent>();
         }
 
 
@@ -193,6 +193,37 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Register Scope's PID namespace so the BPF fork handler can
+    // recognize this parent and track the child's kernel TID.
+    struct stat nsStat{};
+    if (::stat("/proc/self/ns/pid", &nsStat) == -1) {
+        std::cerr << "Failed to inspect PID namespace: "
+                  << std::strerror(errno) << '\n';
+        close(syncPipe[0]);
+        close(syncPipe[1]);
+        ring_buffer__free(rb);
+        scope_bpf__destroy(skel);
+        return 1;
+    }
+
+    launchConfig cfg{};
+    cfg.ns_dev = static_cast<uint64_t>(nsStat.st_dev);
+    cfg.ns_ino = static_cast<uint64_t>(nsStat.st_ino);
+    cfg.parent_tid = static_cast<uint32_t>(getpid());
+    cfg.armed = 1;
+
+    uint32_t launchKey = 0;
+    int launchFd = bpf_map__fd(skel->maps.launch_config);
+    if (launchFd < 0 ||
+        bpf_map_update_elem(launchFd, &launchKey, &cfg, BPF_ANY) != 0) {
+        std::cerr << "Failed to register launch context\n";
+        close(syncPipe[0]);
+        close(syncPipe[1]);
+        ring_buffer__free(rb);
+        scope_bpf__destroy(skel);
+        return 1;
+    }
+
     pid_t child = fork();
     if ( child == 0 ) { // child
         close(syncPipe[1]);
@@ -251,28 +282,17 @@ int main(int argc, char* argv[]) {
             scope_bpf__destroy(skel);
             return 1;
         }
-        // setup tracking
-
-        uint32_t tid = static_cast<uint32_t>(child);
-        uint8_t value = 1;
-
-        int mapFd = bpf_map__fd(skel->maps.tracked_tids);
-
-        int result = bpf_map_update_elem(
-            mapFd,
-            &tid,
-            &value,
-            BPF_ANY
-        );
-        if (result < 0) {
-            std::cerr << "Failed to track child" << std::endl;
-            
+        // The fork tracepoint has already registered the child's kernel TID.
+        // Disarm the initial-launch hook so later unrelated forks are ignored.
+        cfg.armed = 0;
+        if (bpf_map_update_elem(launchFd, &launchKey, &cfg, BPF_ANY) != 0) {
+            std::cerr << "Failed to finalize launch tracking\n";
             close(syncPipe[1]);
 
-            int status;
+            int status = 0;
             while (waitpid(child, &status, 0) == -1 && errno == EINTR) {
-            }            
-            
+            }
+
             ring_buffer__free(rb);
             scope_bpf__destroy(skel);
             return 1;
@@ -283,7 +303,7 @@ int main(int argc, char* argv[]) {
         close(syncPipe[1]);
 
         if (n != 1) {
-            std::cerr << "Failed to release child\n";
+            std::cerr << "Failed to release child" << std::endl;
 
             int status = 0;
             pid_t waited;
@@ -374,14 +394,15 @@ int main(int argc, char* argv[]) {
         exitCode = 1;
     }
 
-    try {
-        saveRecording("recording.scope", recording.events);
-        std::cout << "Saved recording.scope\n";
-    }
-    catch (const std::exception& e) {
-        std::cerr << "Failed to save recording: "
-                << e.what() << '\n';
-        exitCode = 1;
+    if (exitCode == 0) {
+        try {
+            saveRecording("recording.scope", recording.events);
+            std::cout << "Saved recording.scope\n";
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to save recording: "
+                    << e.what() << '\n';
+            exitCode = 1;
+        }
     }
 
     if (childExited && exitCode == 0) {
@@ -397,8 +418,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::cout << "Events received: " << eventCount << std::endl;
-
+    std::cout << "Events received: "
+            << recording.events.size() << std::endl;
     ring_buffer__free(rb);
     scope_bpf__destroy(skel);
 

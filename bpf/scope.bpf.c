@@ -9,17 +9,24 @@ struct {
 
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 1684);
+    __uint(max_entries, 16384);
     __type(key, __u32);
     __type(value, __u8);
 } tracked_tids SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct launchConfig);
+} launch_config SEC(".maps");
 
 SEC("tracepoint/sched/sched_switch")
 int handle_sched_switch( struct trace_event_raw_sched_switch *ctx ) {
     __u32 prev = ctx->prev_pid;
     __u32 next = ctx->next_pid;
-    if (!bpf_map_lookup_elem(&tracked_tids, &prev) ||
-        !bpf_map_lookup_elem(&tracked_tids, &next) ) {
+    if (!bpf_map_lookup_elem(&tracked_tids, &prev) &&
+       !bpf_map_lookup_elem(&tracked_tids, &next)) {
         return 0;
     }
 
@@ -104,20 +111,40 @@ int handle_sched_fork(struct trace_event_raw_sched_process_fork *ctx) {
     __u32 parent = ctx->parent_pid;
 
     if (!bpf_map_lookup_elem(&tracked_tids, &parent)) {
-        return 0;
+        __u32 key = 0;
+
+        struct launchConfig *cfg =
+            bpf_map_lookup_elem(&launch_config, &key);
+
+        if (!cfg || !cfg->armed) {
+            return 0;
+        }
+
+        struct bpf_pidns_info ns = {0};
+
+        if (bpf_get_ns_current_pid_tgid(
+                cfg->ns_dev,
+                cfg->ns_ino,
+                &ns,
+                sizeof(ns)
+            ) != 0) {
+            return 0;
+        }
+
+        if (ns.pid != cfg->parent_tid) {
+            return 0;
+        }
     }
 
     __u32 child = ctx->child_pid;
     __u8 value = 1;
 
-    int ret = bpf_map_update_elem(
-        &tracked_tids,
-        &child,
-        &value,
-        BPF_ANY
-    );
-
-    if (ret < 0) {
+    if (bpf_map_update_elem(
+            &tracked_tids,
+            &child,
+            &value,
+            BPF_ANY
+        ) < 0) {
         return 0;
     }
 

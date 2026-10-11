@@ -10,6 +10,13 @@ enum eventType {
     EVENT_WAKEUP_NEW = 6
 };
 
+struct launchConfig {
+    uint64_t ns_dev;
+    uint64_t ns_ino;
+    uint32_t parent_tid;
+    uint32_t armed;
+};
+
 struct eventHeader {
     uint32_t type;
     uint32_t reserved;

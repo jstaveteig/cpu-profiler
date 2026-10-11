@@ -9,6 +9,7 @@ void saveRecording(
     const std::vector<traceEvent>& events
 );
 
+
 std::vector<traceEvent> loadRecording(
     const std::string& path
 );
