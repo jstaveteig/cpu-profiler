@@ -22,10 +22,10 @@
 volatile std::sig_atomic_t stopRequested = 0;
 static unsigned long long eventCount = 0;
 
-using TraceEvent = std::variant<schedEvent, wakeEvent>;
+using traceEvent = std::variant<schedEvent, wakeEvent>;
 
 struct Recording {
-    std::vector<TraceEvent> events;
+    std::vector<traceEvent> events;
 };
 
 static int handle_event(void* ctx, void* data, size_t data_sz) {
