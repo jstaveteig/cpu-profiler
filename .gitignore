@@ -1,5 +1,6 @@
 # general
-build/
+/build/
+*.scope
 
 # Prerequisites
 *.d
