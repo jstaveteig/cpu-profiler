@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(PkgConfig REQUIRED)
+find_package(SQLite3 REQUIRED)
 
 pkg_check_modules(LIBBPF REQUIRED IMPORTED_TARGET libbpf)
 find_program(BPFTOOL bpftool REQUIRED)
@@ -63,8 +64,11 @@ add_custom_command(
 
 add_custom_target(generate_skeleton DEPENDS "${SCOPE_SKEL}")
 
-add_executable(scope main.cpp)
-
+add_executable(scope
+    main.cpp
+    reconstruct.cpp
+    recording.cpp
+)
 add_dependencies(scope generate_skeleton)
 
 target_include_directories(scope PRIVATE
@@ -72,7 +76,10 @@ target_include_directories(scope PRIVATE
     "${GENERATED_DIR}"
 )
 
-target_link_libraries(scope PRIVATE PkgConfig::LIBBPF)
+target_link_libraries(scope PRIVATE
+    PkgConfig::LIBBPF
+    SQLite::SQLite3
+)
 
 enable_testing()
 

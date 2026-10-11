@@ -16,17 +16,18 @@
 #include <fcntl.h>
 #include <sys/wait.h>
 #include "events.h"
+#include "recording.hpp"
 
 #include "scope.skel.h"
 
 volatile std::sig_atomic_t stopRequested = 0;
 static unsigned long long eventCount = 0;
 
-using TraceEvent = std::variant<
+using traceEvent = std::variant<
     schedEvent,
     wakeEvent,
-    ForkEvent,
-    ExitEvent
+    forkEvent,
+    exitEvent
 >;
 
 struct Recording {
@@ -61,7 +62,7 @@ static int handle_event(void* ctx, void* data, size_t data_sz) {
         recording->events.emplace_back(event);
 
         return 0;
-    }
+    };
 
     switch (header.type) {
         case EVENT_SWITCH: {
@@ -370,6 +371,16 @@ int main(int argc, char* argv[]) {
     if (drained < 0) {
         std::cerr << "Failed to drain ring buffer: "
                 << drained << std::endl;
+        exitCode = 1;
+    }
+
+    try {
+        saveRecording("recording.scope", recording.events);
+        std::cout << "Saved recording.scope\n";
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Failed to save recording: "
+                << e.what() << '\n';
         exitCode = 1;
     }
 
