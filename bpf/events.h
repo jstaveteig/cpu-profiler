@@ -6,7 +6,8 @@ enum eventType {
     EVENT_WAKING = 2,
     EVENT_WAKEUP = 3,
     EVENT_FORK = 4,
-    EVENT_EXIT = 5
+    EVENT_EXIT = 5,
+    EVENT_WAKEUP_NEW = 6
 };
 
 struct eventHeader {

@@ -162,4 +162,31 @@ int handle_sched_free(  struct trace_event_raw_sched_process_template *ctx ) {
     return 0;
 }
 
+SEC("tracepoint/sched/sched_wakeup_new")
+int handle_sched_wakeup_new( struct trace_event_raw_sched_wakeup_template *ctx ) {
+    __u32 target = ctx->pid;
+    if (!bpf_map_lookup_elem(&tracked_tids, &target) ) {
+        return 0;
+    }
+    struct wakeEvent *e;
+    e = bpf_ringbuf_reserve(&events, sizeof(struct wakeEvent), 0);
+    if (!e) {
+        return 0;
+    }
+
+    e->header.type = EVENT_WAKEUP_NEW;
+    e->header.timestamp_ns = bpf_ktime_get_ns();
+    e->header.reserved = 0;
+    e->target_tid = ctx->pid;
+    // bitmask and take only the first 32 bits of current pid
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 tid = pid_tgid & 0xFFFFFFFF;
+    e->current_tid = tid;
+    e->cpu = bpf_get_smp_processor_id();
+    e->target_cpu = ctx->target_cpu;
+
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
