@@ -1,7 +1,7 @@
 #ifndef SCOPE_EVENTS_H
 #define SCOPE_EVENTS_H
 
-// This wire header is consumed by restricted-C BPF and C++20.
+// Shared wire format for BPF C and C++20
 #if defined(SCOPE_BPF_TARGET)
 typedef __u8 scope_u8;
 typedef __u32 scope_u32;
@@ -23,7 +23,8 @@ enum EventType {
     EVENT_WAKEUP = 3,
     EVENT_FORK = 4,
     EVENT_EXIT = 5,
-    EVENT_WAKEUP_NEW = 6
+    EVENT_WAKEUP_NEW = 6,
+    EVENT_SPAN = 7
 };
 
 struct eventHeader {
@@ -43,6 +44,10 @@ struct schedEvent {
     scope_u32 reserved2;
     scope_s32 process_pid; // Namespace-local TGID for captured switch-out stack
     scope_u32 reserved3;
+    char prev_comm[16];
+    char next_comm[16];
+    scope_s32 namespace_tid; // Current task (prev) in launcher PID namespace, if known
+    scope_u32 reserved4;
 };
 
 struct wakeEvent {
@@ -55,6 +60,15 @@ struct wakeEvent {
     scope_u32 reserved;
     scope_s32 process_pid; // Namespace-local TGID for waking-context stack
     scope_u32 reserved2;
+};
+
+// Application markers from scope_span.hpp only
+struct spanEvent {
+    struct eventHeader header;
+    scope_u64 span_id;
+    scope_s32 namespace_tid;
+    scope_u32 phase; // 1 begin, 2 end
+    char name[48];
 };
 
 struct forkEvent {
@@ -86,7 +100,8 @@ struct captureStats {
 
 #ifdef __cplusplus
 static_assert(sizeof(eventHeader) == 16);
-static_assert(sizeof(schedEvent) == 56);
+static_assert(sizeof(schedEvent) == 96);
+static_assert(sizeof(spanEvent) == 80);
 static_assert(sizeof(wakeEvent) == 48);
 static_assert(sizeof(forkEvent) == 24);
 static_assert(sizeof(exitEvent) == 24);

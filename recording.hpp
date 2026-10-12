@@ -6,8 +6,7 @@
 #include <string>
 #include <vector>
 
-// One executable mapping observed while the command was running.
-// These are snapshots, not an authoritative memory-map history.
+// Executable mapping snapshot; gaps between observations
 struct ExecutableMapping {
     std::int32_t process_pid = -1;
     std::uint64_t observed_ns = 0;
@@ -29,7 +28,7 @@ struct RecordingQuality {
     bool available = false; // legacy v1 files have no quality report
 };
 
-// Append directly to SQLite: no arbitrary 200,000-event RAM limit.
+// Direct SQLite writes
 class RecordingWriter {
 public:
     explicit RecordingWriter(const std::string& path);

@@ -9,7 +9,8 @@ using traceEvent = std::variant<
     schedEvent,
     wakeEvent,
     forkEvent,
-    exitEvent
+    exitEvent,
+    spanEvent
 >;
 
 enum class threadState {

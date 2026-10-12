@@ -60,6 +60,11 @@ target_link_libraries(scope PRIVATE scope_core PkgConfig::LIBBPF)
 add_executable(scope-view viewer.cpp)
 target_link_libraries(scope-view PRIVATE scope_core Qt6::Widgets)
 
+find_package(Threads REQUIRED)
+add_executable(stress examples/stress.cpp)
+target_link_libraries(stress PRIVATE Threads::Threads)
+target_compile_options(stress PRIVATE -O1 -g -fno-omit-frame-pointer)
+
 enable_testing()
 add_executable(reconstruct_test tests/reconstruct_test.cpp)
 target_link_libraries(reconstruct_test PRIVATE scope_core)
@@ -68,3 +73,13 @@ add_test(NAME reconstruction COMMAND reconstruct_test)
 add_executable(recording_test tests/recording_test.cpp)
 target_link_libraries(recording_test PRIVATE scope_core)
 add_test(NAME recording COMMAND recording_test)
+
+# Header-only application spans
+add_executable(span_test tests/span_test.cpp)
+target_link_libraries(span_test PRIVATE scope_core)
+add_test(NAME named_spans COMMAND span_test)
+
+add_executable(viewer_test tests/viewer_test.cpp)
+target_link_libraries(viewer_test PRIVATE scope_core Qt6::Widgets)
+add_test(NAME viewer_spans COMMAND viewer_test)
+set_tests_properties(viewer_spans PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

@@ -33,6 +33,8 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <unordered_map>
+#include <cstring>
 #include <utility>
 #include <vector>
 #include <sys/stat.h>
@@ -59,7 +61,16 @@ struct Evidence {
     int wakingProcess = -1;
 };
 
+struct SpanSlice {
+    QString name;
+    std::uint64_t start_ns{};
+    std::uint64_t end_ns{};
+    int depth = 0;
+};
+
 struct ThreadRow {
+    QString name;
+    std::vector<SpanSlice> spans;
     std::int32_t tid{};
     std::uint64_t lifetime{};
     std::vector<Interval> intervals;
@@ -95,9 +106,7 @@ QString formatTime(double ns) {
     return QString::number(ns, 'f', 0) + " ns";
 }
 
-// Symbol lookup is deliberately conservative. Only use mappings captured for
-// the exact process, before the stack observation, and only if the file has
-// not changed since capture. No mapping => no speculative function name.
+// Symbol lookup: same process, mapping predating the stack, unchanged file
 class SymbolResolver {
 public:
     void reset(const std::vector<ExecutableMapping>& maps) {
@@ -158,6 +167,7 @@ private:
 };
 
 class TimelineWidget final : public QWidget {
+    friend struct TimelineTest;
 public:
     explicit TimelineWidget(QWidget* parent = nullptr)
         : QWidget(parent), scrollbar_(new QScrollBar(Qt::Vertical, this)) {
@@ -179,15 +189,43 @@ public:
         switches_.clear();
         waking_.clear();
         wakeups_.clear();
+        std::unordered_map<int, QString> threadNames;
+        std::unordered_map<int, int> localToKernel;
+        std::unordered_map<std::uint64_t, spanEvent> opened;
+        struct Pending { int localTid; SpanSlice span; };
+        std::vector<Pending> completed;
+        auto comm = [](const char (&name)[16]) {
+            return QString::fromUtf8(name, static_cast<int>(strnlen(name, 16)));
+        };
         for (const auto& event : events) {
             if (const auto* sw = std::get_if<schedEvent>(&event)) {
                 switches_.push_back(*sw);
+                if (sw->prev_tid > 0 && sw->prev_comm[0]) threadNames[sw->prev_tid] = comm(sw->prev_comm);
+                if (sw->next_tid > 0 && sw->next_comm[0]) threadNames[sw->next_tid] = comm(sw->next_comm);
+                if (sw->prev_tid > 0 && sw->namespace_tid > 0)
+                    localToKernel[sw->namespace_tid] = sw->prev_tid;
             } else if (const auto* wake = std::get_if<wakeEvent>(&event)) {
                 if (wake->header.type == EVENT_WAKING)
                     waking_.push_back(*wake);
                 else if (wake->header.type == EVENT_WAKEUP ||
                          wake->header.type == EVENT_WAKEUP_NEW)
                     wakeups_.push_back(*wake);
+            } else if (const auto* marker = std::get_if<spanEvent>(&event)) {
+                if (marker->phase == 1) {
+                    opened[marker->span_id] = *marker;
+                } else if (marker->phase == 2) {
+                    auto start = opened.find(marker->span_id);
+                    if (start != opened.end()) {
+                        const auto& begin = start->second;
+                        if (marker->header.timestamp_ns > begin.header.timestamp_ns &&
+                            begin.namespace_tid == marker->namespace_tid) {
+                            completed.push_back({begin.namespace_tid, {
+                                QString::fromUtf8(begin.name, int(strnlen(begin.name, sizeof(begin.name)))),
+                                begin.header.timestamp_ns, marker->header.timestamp_ns}});
+                        }
+                        opened.erase(start);
+                    }
+                }
             }
         }
 
@@ -200,8 +238,39 @@ public:
             row.lifetime = interval.lifetime_id;
             row.intervals.push_back(std::move(interval));
         }
+        spansVisible_ = !completed.empty();
+        for (auto& item : completed) {
+            const int kernelTid = localToKernel.count(item.localTid)
+                ? localToKernel[item.localTid] : -item.localTid;
+            // Lifetime overlapping the span
+            auto destination = grouped.end();
+            for (auto it = grouped.begin(); it != grouped.end(); ++it) {
+                if (it->first.first != kernelTid || it->second.intervals.empty()) continue;
+                const auto& parts = it->second.intervals;
+                const auto start = std::min_element(parts.begin(), parts.end(),
+                    [](const Interval& a, const Interval& b) {return a.start_ns < b.start_ns;})->start_ns;
+                const auto end = std::max_element(parts.begin(), parts.end(),
+                    [](const Interval& a, const Interval& b) {return a.end_ns < b.end_ns;})->end_ns;
+                if (item.span.start_ns <= end && item.span.end_ns >= start) {
+                    destination = it;
+                    break;
+                }
+            }
+            if (destination == grouped.end()) {
+                for (auto it = grouped.begin(); it != grouped.end(); ++it) {
+                    if (it->first.first == kernelTid) { destination = it; break; }
+                }
+            }
+            if (destination == grouped.end()) {
+                const auto key = std::make_pair(kernelTid, std::uint64_t(0));
+                destination = grouped.emplace(key, ThreadRow{}).first;
+                destination->second.tid = kernelTid;
+            }
+            destination->second.spans.push_back(std::move(item.span));
+        }
 
         rows_.clear();
+        spanDepth_ = 0;
         rows_.reserve(grouped.size());
         for (auto& [key, row] : grouped) {
             std::sort(row.intervals.begin(), row.intervals.end(),
@@ -209,6 +278,22 @@ public:
                           if (a.start_ns != b.start_ns) return a.start_ns < b.start_ns;
                           return a.end_ns < b.end_ns;
                       });
+            row.name = threadNames.count(row.tid) ? threadNames[row.tid] : QString();
+            if (row.tid < 0) row.name = QString("operation / tid %1").arg(-row.tid);
+            std::sort(row.spans.begin(), row.spans.end(),
+                      [](const SpanSlice& a, const SpanSlice& b) {
+                          if (a.start_ns != b.start_ns) return a.start_ns < b.start_ns;
+                          return a.end_ns > b.end_ns;
+                      });
+            std::vector<std::uint64_t> laneEnds;
+            for (auto& span : row.spans) {
+                auto lane = std::find_if(laneEnds.begin(), laneEnds.end(),
+                    [&](auto end) { return end <= span.start_ns; });
+                span.depth = int(lane - laneEnds.begin());
+                if (lane == laneEnds.end()) laneEnds.push_back(span.end_ns);
+                else *lane = span.end_ns;
+            }
+            spanDepth_ = std::max(spanDepth_, int(laneEnds.size()));
             rows_.push_back(std::move(row));
         }
 
@@ -226,9 +311,13 @@ public:
                 minNs_ = std::min(minNs_, interval.start_ns);
                 maxNs = std::max(maxNs, interval.end_ns);
             }
+            for (const auto& span : row.spans) {
+                minNs_ = std::min(minNs_, span.start_ns);
+                maxNs = std::max(maxNs, span.end_ns);
+            }
         }
         fullSpan_ = std::max(1.0, static_cast<double>(maxNs - minNs_));
-        // Small event-density overview; it is NOT a CPU utilization graph.
+        // Event density, not CPU utilization
         density_.assign(overviewBins, 0);
         for (const auto& event : events) {
             const auto timestamp = std::visit(
@@ -241,6 +330,8 @@ public:
         filename_ = QFileInfo(filename).fileName();
         eventCount_ = events.size();
         selectedRow_ = selectedInterval_ = -1;
+        selectedSpanRow_ = selectedSpanIndex_ = -1;
+        hoverSpanRow_ = hoverSpanIndex_ = -1;
         selectedSource_.clear();
         hoverRow_ = hoverInterval_ = -1;
         rangeActive_ = rangeDragging_ = overviewDragging_ = false;
@@ -256,7 +347,7 @@ public:
         e.selected = true;
         e.interval = rows_[selectedRow_].intervals[selectedInterval_];
         const auto& in = e.interval;
-        // A block-site user stack is captured at the switch-out that opens the wait.
+        // Block-site stack from the switch-out starting the wait
         if (in.state == threadState::Sleeping || in.state == threadState::Other) {
             for (const auto& sw : switches_) {
                 if (sw.prev_tid == in.tid && sw.header.timestamp_ns == in.start_ns) {
@@ -275,8 +366,7 @@ public:
             }
         }
         if (!foundWakeup) return e;
-        // Closest earlier waking observation for this target; this is evidence,
-        // not proof of a lock owner or the complete reason for the wait.
+        // Nearest earlier waking event; lock ownership and wait cause unknown
         for (const auto& wake : waking_) {
             if (wake.target_tid != in.tid || wake.header.timestamp_ns < in.start_ns ||
                 wake.header.timestamp_ns > in.end_ns) continue;
@@ -292,7 +382,7 @@ public:
     }
 
     bool canJumpToWaker(const Evidence& e) const {
-        // TID 0 identifies kernel/idle execution context, not a userspace thread.
+        // TID 0: kernel/idle context
         if (!e.hasWaking || e.wakerTid <= 0) return false;
         for (const auto& row : rows_) {
             if (row.tid != e.wakerTid) continue;
@@ -314,6 +404,7 @@ public:
                 if (intervals[i].start_ns <= e.wakingNs && e.wakingNs < intervals[i].end_ns) {
                     selectedRow_ = r;
                     selectedInterval_ = i;
+                    selectedSpanRow_ = selectedSpanIndex_ = -1;
                     rangeActive_ = false;
                     selectedSource_.clear();
                     scrollbar_->setValue(std::min(r, scrollbar_->maximum()));
@@ -326,7 +417,7 @@ public:
                 }
             }
         }
-        return false; // waker was external or had no reconstructable interval
+        return false; // External waker or missing interval
     }
 
     struct RankedInterval { int row; int index; std::uint64_t duration; };
@@ -355,6 +446,7 @@ public:
             index >= static_cast<int>(rows_[row].intervals.size())) return;
         selectedRow_ = row;
         selectedInterval_ = index;
+        selectedSpanRow_ = selectedSpanIndex_ = -1;
         rangeActive_ = false;
         const auto& in = rows_[row].intervals[index];
         scrollbar_->setValue(std::min(row, scrollbar_->maximum()));
@@ -376,8 +468,8 @@ public:
         const QString needle = text.trimmed();
         if (needle.isEmpty()) return false;
         for (int r = 0; r < static_cast<int>(rows_.size()); ++r) {
-            const QString label = QString("tid %1 / #%2")
-                .arg(rows_[r].tid).arg(static_cast<qulonglong>(rows_[r].lifetime));
+            const QString label = rows_[r].name + " tid " + QString::number(rows_[r].tid)
+                + " / #" + QString::number(static_cast<qulonglong>(rows_[r].lifetime));
             if (!label.contains(needle, Qt::CaseInsensitive)) continue;
             if (rows_[r].intervals.empty()) continue;
             selectInterval(r, 0);
@@ -401,6 +493,7 @@ public:
 
     void clearSelection() {
         selectedRow_ = selectedInterval_ = -1;
+        selectedSpanRow_ = selectedSpanIndex_ = -1;
         rangeActive_ = false;
         selectedSource_.clear();
         update();
@@ -428,7 +521,7 @@ protected:
         font.setPointSize(9);
         p.setFont(font);
 
-        // Small utilitarian header.
+        // Header
         p.fillRect(QRect(0, 0, width(), 49), QColor("#F5F5F5"));
         p.setPen(QColor("#D7D7D7"));
         p.drawLine(0, 48, width(), 48);
@@ -456,10 +549,7 @@ protected:
         }
 
         const int bottom = height() - footerHeight;
-        // Perfetto-inspired compact overview: a summary of event density.
-        p.setPen(QColor("#808080"));
-        p.drawText(QRect(16, overviewTop, labelWidth - 25, overviewHeight),
-                   Qt::AlignVCenter, "activity");
+        // Event-density overview
         const double overviewWidth = std::max(1, plotRight() - labelWidth);
         const auto peak = *std::max_element(density_.begin(), density_.end());
         if (peak > 0) {
@@ -480,15 +570,15 @@ protected:
         p.drawRect(QRectF(miniLeft, overviewTop, miniWidth, overviewHeight));
 
         p.setPen(QColor("#777777"));
-        p.drawText(16, 90, "thread / lifetime");
+        p.drawText(16, 90, "thread");
 
         const int offset = scrollbar_->value();
-        const int visible = std::max(0, (bottom - rowsTop + rowHeight - 1) / rowHeight);
+        const int visible = std::max(0, (bottom - rowsTop + laneHeight() - 1) / laneHeight());
         for (int i = offset; i < std::min<int>(rows_.size(), offset + visible); ++i) {
-            const int y = rowsTop + (i - offset) * rowHeight;
-            if (i % 2 == 1) p.fillRect(0, y, plotRight(), rowHeight, QColor("#FAFAFA"));
+            const int y = rowsTop + (i - offset) * laneHeight();
+            if (i % 2 == 1) p.fillRect(0, y, plotRight(), laneHeight(), QColor("#FAFAFA"));
             p.setPen(QColor("#ECECEC"));
-            p.drawLine(0, y + rowHeight - 1, plotRight(), y + rowHeight - 1);
+            p.drawLine(0, y + laneHeight() - 1, plotRight(), y + laneHeight() - 1);
         }
 
         const double graphWidth = std::max(1, plotRight() - labelWidth);
@@ -516,7 +606,7 @@ protected:
                             std::max(0, bottom - rowsTop)));
         for (int i = offset; i < std::min<int>(rows_.size(), offset + visible); ++i) {
             const ThreadRow& row = rows_[i];
-            const int y = rowsTop + (i - offset) * rowHeight;
+            const int y = rowsTop + (i - offset) * laneHeight();
             const double earliest = viewStart_;
             const double latest = viewStart_ + viewSpan_;
             auto it = std::lower_bound(row.intervals.begin(), row.intervals.end(), earliest,
@@ -524,6 +614,23 @@ protected:
                     return relativeNs(interval.start_ns) < t;
                 });
             if (it != row.intervals.begin()) --it;
+            for (int j = 0; j < static_cast<int>(row.spans.size()); ++j) {
+                const auto& span = row.spans[j];
+                if (relativeNs(span.end_ns) < earliest || relativeNs(span.start_ns) > latest) continue;
+                const auto bar = spanRect(i, span).intersected(
+                    QRectF(labelWidth, rowsTop, plotRight() - labelWidth, bottom - rowsTop));
+                const auto hue = qHash(span.name, 0) % 360;
+                p.fillRect(bar, QColor::fromHsl(int(hue), 95, 200));
+                if (i == selectedSpanRow_ && j == selectedSpanIndex_) {
+                    p.setPen(QPen(QColor("#507B9A"), 1));
+                    p.drawRect(bar.adjusted(0,0,-1,-1));
+                }
+                if (bar.width() > 24) {
+                    p.setPen(QColor("#25333D"));
+                    p.drawText(bar.adjusted(4,0,-3,0), Qt::AlignVCenter | Qt::AlignLeft,
+                        p.fontMetrics().elidedText(span.name, Qt::ElideRight, int(bar.width()) - 8));
+                }
+            }
             for (; it != row.intervals.end(); ++it) {
                 const double start = relativeNs(it->start_ns);
                 const double end = relativeNs(it->end_ns);
@@ -543,7 +650,7 @@ protected:
         }
         p.restore();
 
-        // Time range selection across all visible tracks.
+        // Time selection across visible tracks
         if (rangeActive_) {
             const double x1 = std::clamp(timeToX(std::min(rangeStart_, rangeEnd_)),
                                          double(labelWidth), double(plotRight()));
@@ -559,12 +666,15 @@ protected:
         }
 
         for (int i = offset; i < std::min<int>(rows_.size(), offset + visible); ++i) {
-            const int y = rowsTop + (i - offset) * rowHeight;
+            const int y = rowsTop + (i - offset) * laneHeight();
             const auto& row = rows_[i];
             p.setPen(QColor("#383838"));
-            const QString label = QString("tid %1  /  #%2").arg(row.tid).arg(static_cast<qulonglong>(row.lifetime));
-            p.drawText(QRect(14, y, labelWidth - 27, rowHeight),
-                       Qt::AlignVCenter | Qt::AlignLeft, label);
+            const QString label = row.name.isEmpty()
+                ? QString("tid %1").arg(row.tid)
+                : QString("%1  ·  %2").arg(row.name).arg(row.tid > 0 ? QString::number(row.tid) : QString());
+            p.drawText(QRect(14, y, labelWidth - 27, laneHeight()),
+                       Qt::AlignVCenter | Qt::AlignLeft,
+                       p.fontMetrics().elidedText(label, Qt::ElideRight, labelWidth - 30));
         }
         if (rows_.empty()) {
             p.setPen(QColor("#777777"));
@@ -611,6 +721,7 @@ protected:
             rangeDragging_ = rangeActive_ = true;
             rangeStart_ = rangeEnd_ = xToRelative(event->position().x());
             selectedRow_ = selectedInterval_ = -1;
+            selectedSpanRow_ = selectedSpanIndex_ = -1;
             selectedSource_.clear();
             if (onSelectionChanged) onSelectionChanged();
             update();
@@ -645,12 +756,34 @@ protected:
             }
         } else {
             const auto [r, i] = hitTest(event->position());
-            if (r != hoverRow_ || i != hoverInterval_) {
+            const auto [sr, si] = spanHitTest(event->position());
+            if (r != hoverRow_ || i != hoverInterval_ ||
+                sr != hoverSpanRow_ || si != hoverSpanIndex_) {
                 hoverRow_ = r;
                 hoverInterval_ = i;
+                hoverSpanRow_ = sr;
+                hoverSpanIndex_ = si;
                 update();
             }
         }
+    }
+
+    void mouseDoubleClickEvent(QMouseEvent* event) override {
+        if (event->button() != Qt::LeftButton) return;
+        const auto [r, i] = spanHitTest(event->position());
+        if (r < 0) return;
+        selectedSpanRow_ = r;
+        selectedSpanIndex_ = i;
+        selectedRow_ = selectedInterval_ = -1;
+        rangeActive_ = dragging_ = false;
+        setCursor(Qt::ArrowCursor);
+        const auto& span = rows_[r].spans[i];
+        viewSpan_ = std::clamp(double(span.end_ns - span.start_ns) * 1.2,
+                              std::min(fullSpan_, 1'000.0), fullSpan_);
+        viewStart_ = std::clamp(relativeNs(span.start_ns) - viewSpan_ / 12.0,
+                               0.0, std::max(0.0, fullSpan_ - viewSpan_));
+        if (onSelectionChanged) onSelectionChanged();
+        update();
     }
 
     void mouseReleaseEvent(QMouseEvent* event) override {
@@ -674,6 +807,10 @@ protected:
             const auto [r, i] = hitTest(event->position());
             selectedRow_ = r;
             selectedInterval_ = i;
+            const auto [sr, si] = spanHitTest(event->position());
+            selectedSpanRow_ = sr;
+            selectedSpanIndex_ = si;
+            if (sr >= 0) selectedRow_ = selectedInterval_ = -1;
             rangeActive_ = false;
             selectedSource_.clear();
             if (onSelectionChanged) onSelectionChanged();
@@ -682,6 +819,11 @@ protected:
     }
 
 private:
+    int laneHeight() const { return spansVisible_ ? 26 + spanDepth_ * 20 : 32; }
+    int spanDepth_ = 0;
+    bool spansVisible_ = false;
+    int selectedSpanRow_ = -1, selectedSpanIndex_ = -1;
+    int hoverSpanRow_ = -1, hoverSpanIndex_ = -1;
     std::vector<ThreadRow> rows_;
     std::vector<std::uint32_t> density_;
     bool overviewDragging_ = false;
@@ -736,8 +878,25 @@ private:
     QRectF intervalRect(int row, const Interval& interval) const {
         const double x = timeToX(relativeNs(interval.start_ns));
         const double endX = timeToX(relativeNs(interval.end_ns));
-        const double y = rowsTop + (row - scrollbar_->value()) * rowHeight + 7;
-        return QRectF(x, y, std::max(1.0, endX - x), 18);
+        const double y = rowsTop + (row - scrollbar_->value()) * laneHeight() + (spansVisible_ ? 4 : 7);
+        return QRectF(x, y, std::max(1.0, endX - x), spansVisible_ ? 10 : 18);
+    }
+
+    QRectF spanRect(int row, const SpanSlice& span) const {
+        const double x = timeToX(relativeNs(span.start_ns));
+        const double end = timeToX(relativeNs(span.end_ns));
+        const double y = rowsTop + (row - scrollbar_->value()) * laneHeight() + 20 + span.depth * 20;
+        return QRectF(x, y, std::max(1.0, end - x), 18);
+    }
+
+    std::pair<int,int> spanHitTest(const QPointF& pos) const {
+        if (!spansVisible_ || pos.x() < labelWidth || pos.x() > plotRight() ||
+            pos.y() < rowsTop || pos.y() >= height() - footerHeight) return {-1,-1};
+        const int row = scrollbar_->value() + int((pos.y() - rowsTop) / laneHeight());
+        if (row < 0 || row >= int(rows_.size())) return {-1,-1};
+        for (int j=0; j < int(rows_[row].spans.size()); ++j)
+            if (spanRect(row, rows_[row].spans[j]).contains(pos)) return {row,j};
+        return {-1,-1};
     }
 
     void pan(double offset) {
@@ -748,7 +907,7 @@ private:
 
     void updateScrollbar() {
         const int bottom = height() - footerHeight;
-        const int visibleRows = std::max(1, (bottom - rowsTop) / rowHeight);
+        const int visibleRows = std::max(1, (bottom - rowsTop) / laneHeight());
         scrollbar_->setRange(0, std::max(0, static_cast<int>(rows_.size()) - visibleRows));
         scrollbar_->setPageStep(visibleRows);
         const bool needed = static_cast<int>(rows_.size()) > visibleRows;
@@ -761,7 +920,7 @@ private:
         if (position.x() < labelWidth || position.x() > plotRight() ||
             position.y() < rowsTop || position.y() >= bottom) return {-1, -1};
         const int row = scrollbar_->value() +
-                        static_cast<int>((position.y() - rowsTop) / rowHeight);
+                        static_cast<int>((position.y() - rowsTop) / laneHeight());
         if (row < 0 || row >= static_cast<int>(rows_.size())) return {-1, -1};
         const auto& intervals = rows_[row].intervals;
         for (int i = 0; i < static_cast<int>(intervals.size()); ++i) {
@@ -783,6 +942,20 @@ private:
                 .arg(formatTime(start)).arg(formatTime(end)).arg(formatTime(end - start)));
             return;
         }
+        const int spanRow = selectedSpanRow_ >= 0 ? selectedSpanRow_
+            : (selectedRow_ < 0 ? hoverSpanRow_ : -1);
+        const int spanIndex = selectedSpanRow_ >= 0 ? selectedSpanIndex_ : hoverSpanIndex_;
+        if (spanRow >= 0 && spanIndex >= 0 && spanRow < int(rows_.size()) &&
+            spanIndex < int(rows_[spanRow].spans.size())) {
+            const auto& span = rows_[spanRow].spans[spanIndex];
+            p.setPen(QColor("#333333"));
+            p.drawText(16, y + 29, QString("%1  ·  %2  ·  TID %3")
+                .arg(span.name).arg(formatTime(double(span.end_ns - span.start_ns)))
+                .arg(std::abs(rows_[spanRow].tid)));
+            p.drawText(16, y + 53, QString("Start %1  ·  Double-click to zoom")
+                .arg(formatTime(relativeNs(span.start_ns))));
+            return;
+        }
         const int r = selectedRow_ >= 0 ? selectedRow_ : hoverRow_;
         const int i = selectedRow_ >= 0 ? selectedInterval_ : hoverInterval_;
         p.setPen(QColor("#333333"));
@@ -797,8 +970,8 @@ private:
         const double start = relativeNs(in.start_ns);
         const double end = relativeNs(in.end_ns);
         p.drawText(16, y + (selectedSource_.isEmpty() ? 43 : 29),
-            QString("TID %1  ·  %2  ·  %3%4")
-                .arg(row.tid)
+            QString("%1  ·  %2  ·  %3%4")
+                .arg(row.name.isEmpty() ? QString("TID %1").arg(row.tid) : row.name)
                 .arg(stateName(in.state))
                 .arg(formatTime(end - start))
                 .arg(in.cpu >= 0 ? QString("  ·  CPU %1").arg(in.cpu) : QString()));
@@ -856,7 +1029,7 @@ int main(int argc, char* argv[]) {
             selectedBlockingFrames = load(e.blockingStack);
             if (e.hasWaking) selectedWakingFrames = load(e.wakingStack);
             if (!selectedBlockingFrames.empty()) {
-                // Try several frames: the first may be a runtime or trampoline.
+                // Multiple frames to skip runtime and trampoline code
                 for (std::size_t n = 0; n < std::min<std::size_t>(6, selectedBlockingFrames.size()); ++n) {
                     const QString candidate = resolver.resolve(
                         selectedBlockingFrames[n], e.blockingProcess, e.interval.start_ns);

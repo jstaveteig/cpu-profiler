@@ -32,10 +32,10 @@ auto decodeState = [](int64_t state) {
 std::vector<Interval> reconstruct(
     const std::vector<traceEvent>& events
 ) {
-    // Copy events so we don't modify the caller's data.
+    // Local copy for sorting
     std::vector<traceEvent> sortedEvents = events;
 
-    // Sort events chronologically.
+    // Timestamp order
     std::stable_sort(
         sortedEvents.begin(),
         sortedEvents.end(),
@@ -66,12 +66,6 @@ std::vector<Interval> reconstruct(
                         int32_t cpu,
                         TransitionSource source) {
 
-        //std::cerr
-        //    << "Transition: tid=" << tid
-        //    << " timestamp=" << timestamp
-        //    << " state=" << static_cast<int>(newState)
-        //    << " source=" << static_cast<int>(source)
-        //    << '\n';
 
         if (tid <= 0) {
             return;
@@ -219,8 +213,6 @@ std::vector<Interval> reconstruct(
         }
     }
 
-    //std::cerr << "Total intervals: "
-    //        << intervals.size() << '\n';
 
     for (const auto& interval : intervals) {
         std::cerr

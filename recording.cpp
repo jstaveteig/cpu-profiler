@@ -39,7 +39,7 @@ int schemaVersion(sqlite3* db) {
     const int rc = sqlite3_step(s);
     const int version = (rc == SQLITE_ROW) ? sqlite3_column_int(s, 0) : -1;
     sqlite3_finalize(s);
-    if (version != 1 && version != 2 && version != 3) throw std::runtime_error("Unsupported .scope schema version");
+    if (version != 1 && version != 2 && version != 3 && version != 4) throw std::runtime_error("Unsupported .scope schema version");
     return version;
 }
 } // namespace
@@ -69,7 +69,9 @@ RecordingWriter::RecordingWriter(const std::string& path) {
                 prev_tid INTEGER, next_tid INTEGER, prev_state INTEGER, cpu INTEGER,
                 target_tid INTEGER, current_tid INTEGER, target_cpu INTEGER,
                 parent_tid INTEGER, child_tid INTEGER, tid INTEGER,
-                stack_id INTEGER, process_pid INTEGER
+                stack_id INTEGER, process_pid INTEGER,
+                prev_comm TEXT, next_comm TEXT, namespace_tid INTEGER,
+                span_id INTEGER, span_phase INTEGER, span_name TEXT
             );
             CREATE TABLE stacks (id INTEGER PRIMARY KEY, pcs BLOB NOT NULL);
             CREATE TABLE metadata (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
@@ -81,12 +83,13 @@ RecordingWriter::RecordingWriter(const std::string& path) {
             );
             CREATE INDEX idx_maps_process_time ON executable_maps(process_pid,observed_ns);
             CREATE INDEX idx_events_time ON events(timestamp_ns);
-            PRAGMA user_version=3;
+            PRAGMA user_version=4;
         )SQL");
         const char* insert = R"SQL(
             INSERT INTO events(type,timestamp_ns,prev_tid,next_tid,prev_state,cpu,
-                               target_tid,current_tid,target_cpu,parent_tid,child_tid,tid,stack_id,process_pid)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?);
+                               target_tid,current_tid,target_cpu,parent_tid,child_tid,tid,stack_id,process_pid,
+                               prev_comm,next_comm,namespace_tid,span_id,span_phase,span_name)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?);
         )SQL";
         if (sqlite3_prepare_v2(db_, insert, -1, &eventStmt_, nullptr) != SQLITE_OK)
             throw sqlError(db_);
@@ -146,6 +149,9 @@ void RecordingWriter::append(const traceEvent& event) {
             check(sqlite3_bind_int(eventStmt_, 6, e.cpu));
             check(sqlite3_bind_int(eventStmt_, 13, e.stack_id));
             check(sqlite3_bind_int(eventStmt_, 14, e.process_pid));
+            check(sqlite3_bind_text(eventStmt_, 15, e.prev_comm, strnlen(e.prev_comm, 16), SQLITE_TRANSIENT));
+            check(sqlite3_bind_text(eventStmt_, 16, e.next_comm, strnlen(e.next_comm, 16), SQLITE_TRANSIENT));
+            check(sqlite3_bind_int(eventStmt_, 17, e.namespace_tid));
         } else if constexpr (std::is_same_v<T, wakeEvent>) {
             check(sqlite3_bind_int(eventStmt_, 6, e.cpu));
             check(sqlite3_bind_int(eventStmt_, 7, e.target_tid));
@@ -158,6 +164,11 @@ void RecordingWriter::append(const traceEvent& event) {
             check(sqlite3_bind_int(eventStmt_, 11, e.child_tid));
         } else if constexpr (std::is_same_v<T, exitEvent>) {
             check(sqlite3_bind_int(eventStmt_, 12, e.tid));
+        } else if constexpr (std::is_same_v<T, spanEvent>) {
+            check(sqlite3_bind_int64(eventStmt_, 18, static_cast<sqlite3_int64>(e.span_id)));
+            check(sqlite3_bind_int(eventStmt_, 19, e.phase));
+            check(sqlite3_bind_int(eventStmt_, 17, e.namespace_tid));
+            check(sqlite3_bind_text(eventStmt_, 20, e.name, strnlen(e.name, sizeof(e.name)), SQLITE_TRANSIENT));
         }
     }, event);
     if (sqlite3_step(eventStmt_) != SQLITE_DONE) throw sqlError(db_);
@@ -229,7 +240,12 @@ void saveRecording(const std::string& path, const std::vector<traceEvent>& event
 std::vector<traceEvent> loadRecording(const std::string& path) {
     Reader r(path);
     const int version = schemaVersion(r.db);
-    r.prepare(version == 3 ? R"SQL(
+    r.prepare(version == 4 ? R"SQL(
+        SELECT type,timestamp_ns,prev_tid,next_tid,prev_state,cpu,
+               target_tid,current_tid,target_cpu,parent_tid,child_tid,tid,stack_id,process_pid,
+               prev_comm,next_comm,namespace_tid,span_id,span_phase,span_name
+        FROM events ORDER BY seq;
+    )SQL" : version == 3 ? R"SQL(
         SELECT type,timestamp_ns,prev_tid,next_tid,prev_state,cpu,
                target_tid,current_tid,target_cpu,parent_tid,child_tid,tid,stack_id,process_pid
         FROM events ORDER BY seq;
@@ -267,7 +283,16 @@ std::vector<traceEvent> loadRecording(const std::string& path) {
                 e.cpu = sqlite3_column_int(r.stmt, 5);
                 e.stack_id = version >= 2 && sqlite3_column_type(r.stmt,12) != SQLITE_NULL
                     ? sqlite3_column_int(r.stmt, 12) : -1;
-                e.process_pid = version == 3 && sqlite3_column_type(r.stmt,13) != SQLITE_NULL ? sqlite3_column_int(r.stmt,13) : -1;
+                e.process_pid = version >= 3 && sqlite3_column_type(r.stmt,13) != SQLITE_NULL ? sqlite3_column_int(r.stmt,13) : -1;
+                if (version >= 4) {
+                    auto copyName = [&](int column, char* target) {
+                        const auto* text = sqlite3_column_text(r.stmt, column);
+                        if (text) std::strncpy(target, reinterpret_cast<const char*>(text), 15);
+                    };
+                    copyName(14, e.prev_comm);
+                    copyName(15, e.next_comm);
+                    e.namespace_tid = sqlite3_column_type(r.stmt,16) == SQLITE_NULL ? -1 : sqlite3_column_int(r.stmt,16);
+                } else e.namespace_tid = -1;
                 events.emplace_back(e);
                 break;
             }
@@ -282,7 +307,7 @@ std::vector<traceEvent> loadRecording(const std::string& path) {
                 e.target_cpu = sqlite3_column_int(r.stmt, 8);
                 e.stack_id = version >= 2 && sqlite3_column_type(r.stmt,12) != SQLITE_NULL
                     ? sqlite3_column_int(r.stmt, 12) : -1;
-                e.process_pid = version == 3 && sqlite3_column_type(r.stmt,13) != SQLITE_NULL ? sqlite3_column_int(r.stmt,13) : -1;
+                e.process_pid = version >= 3 && sqlite3_column_type(r.stmt,13) != SQLITE_NULL ? sqlite3_column_int(r.stmt,13) : -1;
                 events.emplace_back(e);
                 break;
             }
@@ -298,6 +323,21 @@ std::vector<traceEvent> loadRecording(const std::string& path) {
                 required({11});
                 exitEvent e{}; e.header.type=type; e.header.timestamp_ns=timestamp;
                 e.tid=sqlite3_column_int(r.stmt,11);
+                events.emplace_back(e);
+                break;
+            }
+            case EVENT_SPAN: {
+                if (version < 4) throw std::runtime_error("Unexpected span in old recording");
+                required({16,17,18,19});
+                spanEvent e{};
+                e.header.type = type;
+                e.header.timestamp_ns = timestamp;
+                e.namespace_tid = sqlite3_column_int(r.stmt,16);
+                e.span_id = static_cast<scope_u64>(sqlite3_column_int64(r.stmt,17));
+                e.phase = static_cast<scope_u32>(sqlite3_column_int(r.stmt,18));
+                const auto* name = sqlite3_column_text(r.stmt,19);
+                if (name) std::strncpy(e.name, reinterpret_cast<const char*>(name), sizeof(e.name)-1);
+                if (e.phase != 1 && e.phase != 2) throw std::runtime_error("Invalid span phase");
                 events.emplace_back(e);
                 break;
             }

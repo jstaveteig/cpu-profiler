@@ -12,6 +12,7 @@
 #include <iostream>
 #include <memory>
 #include <pwd.h>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
@@ -23,9 +24,11 @@
 #include <chrono>
 #include <thread>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <sys/sysmacros.h>
 #include <time.h>
+#include <sys/socket.h>
 
 namespace {
 volatile std::sig_atomic_t stopRequested = 0;
@@ -36,6 +39,8 @@ struct CaptureContext {
     int stackMapFd = -1;
     std::unordered_set<std::int32_t> savedStacks;
     std::string error;
+    std::function<void()> drainMarkers;
+    unsigned eventsSinceDrain = 0;
 };
 
 int handleEvent(void* ctx, void* data, size_t size) {
@@ -44,6 +49,10 @@ int handleEvent(void* ctx, void* data, size_t size) {
     eventHeader h{};
     std::memcpy(&h, data, sizeof(h));
     try {
+        if (++c.eventsSinceDrain >= 64 && c.drainMarkers) {
+            c.eventsSinceDrain = 0;
+            c.drainMarkers();
+        }
         auto store = [&]<typename T>() -> int {
             if (size != sizeof(T)) return -EINVAL;
             T e{};
@@ -53,7 +62,7 @@ int handleEvent(void* ctx, void* data, size_t size) {
                     std::array<std::uint64_t, SCOPE_STACK_DEPTH> pcs{};
                     if (bpf_map_lookup_elem(c.stackMapFd, &e.stack_id, pcs.data()) == 0)
                         c.writer->storeStack(e.stack_id, pcs);
-                    // The ID is still stored in the event if stack lookup fails.
+                    // Stack ID retained on lookup failure
                 }
             }
             c.writer->append(e);
@@ -102,8 +111,7 @@ Identity sudoIdentity() {
     return i;
 }
 
-// Snapshot executable mappings for the launched process while it still exists.
-// This is deliberately sampled: short-lived mappings may not be observed.
+// Sampled executable mappings; short-lived mappings may be missed
 std::vector<ExecutableMapping> executableMaps(pid_t pid) {
     std::ifstream stream("/proc/" + std::to_string(pid) + "/maps");
     std::vector<ExecutableMapping> maps;
@@ -137,7 +145,7 @@ std::vector<ExecutableMapping> executableMaps(pid_t pid) {
             map.modified_ns = static_cast<std::int64_t>(st.st_mtim.tv_sec) * 1'000'000'000
                               + st.st_mtim.tv_nsec;
             maps.push_back(std::move(map));
-        } catch (const std::exception&) { /* Ignore malformed procfs lines. */ }
+        } catch (const std::exception&) { /* Malformed procfs line */ }
     }
     return maps;
 }
@@ -179,6 +187,15 @@ int main(int argc, char* argv[]) {
         int syncPipe[2]{};
         if (pipe2(syncPipe, O_CLOEXEC) != 0)
             throw std::runtime_error("Could not create launch pipe");
+        // Optional spans over nonblocking datagrams
+        int markerSockets[2]{};
+        if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                       0, markerSockets) != 0) {
+            close(syncPipe[0]); close(syncPipe[1]);
+            throw std::runtime_error("Could not create span channel");
+        }
+        const int markerBuffer = 1024 * 1024;
+        setsockopt(markerSockets[1], SOL_SOCKET, SO_SNDBUF, &markerBuffer, sizeof(markerBuffer));
 
         struct stat ns{};
         if (stat("/proc/self/ns/pid", &ns) != 0) {
@@ -200,6 +217,7 @@ int main(int argc, char* argv[]) {
         pid_t child = fork();
         if (child == 0) {
             close(syncPipe[1]);
+            close(markerSockets[0]);
             char ready = 0;
             ssize_t n;
             do { n = read(syncPipe[0], &ready, 1); } while (n < 0 && errno == EINTR);
@@ -209,17 +227,24 @@ int main(int argc, char* argv[]) {
                 setresgid(identity.gid, identity.gid, identity.gid) != 0 ||
                 setresuid(identity.uid, identity.uid, identity.uid) != 0)
                 _exit(126);
+            // Marker socket inherited across exec for scope::Span
+            const int fdFlags = fcntl(markerSockets[1], F_GETFD);
+            if (fdFlags < 0 || fcntl(markerSockets[1], F_SETFD, fdFlags & ~FD_CLOEXEC) != 0)
+                _exit(126);
+            const std::string markerFd = std::to_string(markerSockets[1]);
+            if (setenv("SCOPE_SPAN_FD", markerFd.c_str(), 1) != 0) _exit(126);
             execvp(argv[3], &argv[3]);
             _exit(127);
         }
         close(syncPipe[0]);
+        close(markerSockets[1]);
         if (child < 0) {
             close(syncPipe[1]);
             throw std::runtime_error("fork() failed");
         }
 
-        // Preserve a partial recording if capture fails; metadata marks it incomplete.
-        // The child is blocked until both SQLite and process tracking are ready.
+        // Partial recording retained on failure, marked incomplete
+        // Child blocked until SQLite and process tracking are ready
         std::unique_ptr<RecordingWriter> writer;
         try {
             writer = std::make_unique<RecordingWriter>("recording.scope");
@@ -254,20 +279,45 @@ int main(int argc, char* argv[]) {
             throw std::runtime_error("Could not release target process");
         }
 
+        auto drainMarkers = [&] {
+            for (;;) {
+                spanEvent marker{};
+                ssize_t n = recv(markerSockets[0], &marker, sizeof(marker), MSG_DONTWAIT | MSG_TRUNC);
+                if (n < 0 && errno == EINTR) continue;
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                if (n < 0) throw std::runtime_error("Span channel read failed");
+                if (n == sizeof(marker) && marker.header.type == EVENT_SPAN &&
+                    (marker.phase == 1 || marker.phase == 2) && marker.name[sizeof(marker.name)-1] == 0) {
+                    writer->append(marker);
+                }
+            }
+        };
+        capture.drainMarkers = drainMarkers;
         std::string previousMaps;
         auto lastMapRead = std::chrono::steady_clock::time_point{};
         int status = 0;
         bool childExited = false;
         bool captureFailed = false;
+        pollfd inputs[] = {{ring_buffer__epoll_fd(ring.get()), POLLIN, 0},
+                           {markerSockets[0], POLLIN, 0}};
         while (!stopRequested) {
-            int result = ring_buffer__poll(ring.get(), 30);
+            int ready = poll(inputs, 2, 30);
+            if (ready < 0 && errno != EINTR) {
+                captureFailed = true;
+                break;
+            }
+            try { drainMarkers(); }
+            catch (const std::exception& e) { std::cerr << e.what() << '\n'; captureFailed = true; break; }
+            int result = ring_buffer__consume(ring.get());
             if (result < 0 && result != -EINTR) {
                 std::cerr << "Capture failed: "
                           << (capture.error.empty() ? std::to_string(result) : capture.error) << '\n';
                 captureFailed = true;
                 break;
             }
-            // Sample mappings at a low rate; only store them when changed.
+            try { drainMarkers(); }
+            catch (const std::exception& e) { std::cerr << e.what() << '\n'; captureFailed = true; break; }
+            // Low-rate mapping snapshots, stored on change
             const auto now = std::chrono::steady_clock::now();
             if (now - lastMapRead >= std::chrono::milliseconds(30)) {
                 lastMapRead = now;
@@ -289,9 +339,9 @@ int main(int argc, char* argv[]) {
             if (finished == -1 && errno != EINTR) { captureFailed = true; break; }
         }
         if (!childExited) {
-            // The first release only supervises the direct child, not detached descendants.
+            // Direct-child supervision only
             if (kill(child, SIGTERM) != 0 && errno != ESRCH) captureFailed = true;
-            // Bound shutdown time if a server ignores TERM.
+            // Bounded shutdown after TERM
             for (int attempt = 0; attempt < 40; ++attempt) {
                 const auto waited = waitpid(child, &status, WNOHANG);
                 if (waited == child) { childExited = true; break; }
@@ -305,6 +355,10 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        try { drainMarkers(); }
+        catch (const std::exception& e) { std::cerr << e.what() << '\n'; captureFailed = true; }
+        capture.drainMarkers = {};
+        close(markerSockets[0]);
         scope_bpf__detach(skel.get());
         for (;;) {
             int result = ring_buffer__consume(ring.get());
@@ -325,7 +379,7 @@ int main(int argc, char* argv[]) {
                            !stats.dropped_events && !stats.tracking_failures;
         writer->finish(quality);
 
-        // Keep the file readable by the user who invoked sudo.
+        // Recording ownership restored to the sudo caller
         if (chown("recording.scope", identity.uid, identity.gid) != 0)
             std::cerr << "Warning: recording.scope is owned by root\n";
         std::cout << "Saved recording.scope (" << writer->count() << " events, "

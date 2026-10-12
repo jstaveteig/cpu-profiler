@@ -1,10 +1,12 @@
-// Scope's known delay: worker waits for an intentionally slow producer.
+// Worker blocked on a slow producer
 // Build with: g++ -std=c++20 -O1 -g -fno-omit-frame-pointer -pthread examples/stall_demo.cpp -o stall-demo
 #include <chrono>
 #include <condition_variable>
 #include <iostream>
 #include <mutex>
 #include <thread>
+#include <pthread.h>
+#include "scope_span.hpp"
 
 using namespace std::chrono_literals;
 
@@ -13,13 +15,17 @@ std::condition_variable workReady;
 bool ready = false;
 
 void takeWork() {
+    pthread_setname_np(pthread_self(), "scope-worker");
+    scope::Span span("wait_for_work");
     std::unique_lock<std::mutex> lock(mutex);
-    workReady.wait(lock, [] { return ready; }); // The deliberately blocked site.
+    workReady.wait(lock, [] { return ready; }); // Blocked worker
     std::cout << "Worker received work\n";
 }
 
 void produceWork() {
-    // Deliberately postpone the handoff to make the wait easy to find.
+    pthread_setname_np(pthread_self(), "scope-producer");
+    scope::Span span("produce_work");
+    // 450 ms handoff delay
     std::this_thread::sleep_for(450ms);
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -29,7 +35,7 @@ void produceWork() {
 }
 
 int main() {
-    // Allow the recorder to observe this executable's memory mappings first.
+    // Startup delay for mapping capture
     std::this_thread::sleep_for(100ms);
     std::thread worker(takeWork);
     std::thread producer(produceWork);

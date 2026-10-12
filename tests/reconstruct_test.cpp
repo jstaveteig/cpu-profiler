@@ -82,12 +82,12 @@ void expectCount(const std::vector<Interval>& intervals, std::size_t expected) {
 
 void testNormalWaitAndOrdering() {
     std::vector<traceEvent> events{
-        makeSwitch(328, 0, worker),          // Worker starts running again.
-        makeWake(310, EVENT_WAKEUP),         // Repeated wakeup: must not reset 300.
-        makeSwitch(120, worker, 0, 1),      // Worker goes to sleep.
-        makeWake(290, EVENT_WAKING),         // Initiation alone changes no state.
-        makeSwitch(100, 0, worker),          // Worker starts running.
-        makeWake(300, EVENT_WAKEUP),         // Worker becomes runnable.
+        makeSwitch(328, 0, worker),          // Worker running again
+        makeWake(310, EVENT_WAKEUP),         // Repeated wakeup; timestamp still 300
+        makeSwitch(120, worker, 0, 1),      // Worker asleep
+        makeWake(290, EVENT_WAKING),         // Wake initiation; state unchanged
+        makeSwitch(100, 0, worker),          // Worker running
+        makeWake(300, EVENT_WAKEUP),         // Worker runnable
 
     };
 
@@ -158,7 +158,7 @@ void testMissingWakeup() {
     std::vector<traceEvent> events{
         makeSwitch(100, 0, worker),
         makeSwitch(120, worker, 0, 1),
-        makeSwitch(328, 0, worker),  // No wakeup observed.
+        makeSwitch(328, 0, worker),  // Missing wakeup
     };
 
     const auto intervals = reconstruct(events);
