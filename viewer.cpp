@@ -12,6 +12,8 @@
 #include <QCursor>
 #include <QStandardPaths>
 #include <QKeySequence>
+#include <QLineEdit>
+#include <QShortcut>
 #include <QFontDatabase>
 #include <QMainWindow>
 #include <QMessageBox>
@@ -41,6 +43,9 @@ constexpr int labelWidth = 184;
 constexpr int rowHeight = 32;
 constexpr int rowsTop = 112;
 constexpr int footerHeight = 77;
+constexpr int overviewTop = 53;
+constexpr int overviewHeight = 13;
+constexpr int overviewBins = 256;
 
 struct Evidence {
     bool selected = false;
@@ -223,11 +228,22 @@ public:
             }
         }
         fullSpan_ = std::max(1.0, static_cast<double>(maxNs - minNs_));
+        // Small event-density overview; it is NOT a CPU utilization graph.
+        density_.assign(overviewBins, 0);
+        for (const auto& event : events) {
+            const auto timestamp = std::visit(
+                [](const auto& item) { return item.header.timestamp_ns; }, event);
+            const double relative = static_cast<double>(timestamp - minNs_);
+            const auto bin = static_cast<int>(std::clamp(
+                relative / fullSpan_ * overviewBins, 0.0, double(overviewBins - 1)));
+            ++density_[bin];
+        }
         filename_ = QFileInfo(filename).fileName();
         eventCount_ = events.size();
         selectedRow_ = selectedInterval_ = -1;
         selectedSource_.clear();
         hoverRow_ = hoverInterval_ = -1;
+        rangeActive_ = rangeDragging_ = overviewDragging_ = false;
         fit();
         if (onSelectionChanged) onSelectionChanged();
     }
@@ -298,6 +314,7 @@ public:
                 if (intervals[i].start_ns <= e.wakingNs && e.wakingNs < intervals[i].end_ns) {
                     selectedRow_ = r;
                     selectedInterval_ = i;
+                    rangeActive_ = false;
                     selectedSource_.clear();
                     scrollbar_->setValue(std::min(r, scrollbar_->maximum()));
                     const double center = relativeNs(e.wakingNs);
@@ -338,6 +355,7 @@ public:
             index >= static_cast<int>(rows_[row].intervals.size())) return;
         selectedRow_ = row;
         selectedInterval_ = index;
+        rangeActive_ = false;
         const auto& in = rows_[row].intervals[index];
         scrollbar_->setValue(std::min(row, scrollbar_->maximum()));
         const double center = relativeNs(in.start_ns) + double(in.end_ns - in.start_ns) / 2.0;
@@ -352,6 +370,41 @@ public:
     void setSourceSummary(const QString& source) {
         selectedSource_ = source;
         update();
+    }
+
+    bool findThread(const QString& text) {
+        const QString needle = text.trimmed();
+        if (needle.isEmpty()) return false;
+        for (int r = 0; r < static_cast<int>(rows_.size()); ++r) {
+            const QString label = QString("tid %1 / #%2")
+                .arg(rows_[r].tid).arg(static_cast<qulonglong>(rows_[r].lifetime));
+            if (!label.contains(needle, Qt::CaseInsensitive)) continue;
+            if (rows_[r].intervals.empty()) continue;
+            selectInterval(r, 0);
+            return true;
+        }
+        return false;
+    }
+
+    bool zoomToRange() {
+        if (!rangeActive_) return false;
+        const double start = std::min(rangeStart_, rangeEnd_);
+        const double end = std::max(rangeStart_, rangeEnd_);
+        const double minSpan = std::min(fullSpan_, 1'000.0);
+        if (end - start < minSpan) return false;
+        viewSpan_ = std::clamp((end - start) * 1.05, minSpan, fullSpan_);
+        viewStart_ = std::clamp((start + end - viewSpan_) * 0.5, 0.0,
+                                std::max(0.0, fullSpan_ - viewSpan_));
+        update();
+        return true;
+    }
+
+    void clearSelection() {
+        selectedRow_ = selectedInterval_ = -1;
+        rangeActive_ = false;
+        selectedSource_.clear();
+        update();
+        if (onSelectionChanged) onSelectionChanged();
     }
 
     void fit() {
@@ -403,6 +456,29 @@ protected:
         }
 
         const int bottom = height() - footerHeight;
+        // Perfetto-inspired compact overview: a summary of event density.
+        p.setPen(QColor("#808080"));
+        p.drawText(QRect(16, overviewTop, labelWidth - 25, overviewHeight),
+                   Qt::AlignVCenter, "activity");
+        const double overviewWidth = std::max(1, plotRight() - labelWidth);
+        const auto peak = *std::max_element(density_.begin(), density_.end());
+        if (peak > 0) {
+            const double binWidth = overviewWidth / overviewBins;
+            for (int i = 0; i < overviewBins; ++i) {
+                if (!density_[i]) continue;
+                const double fraction = std::sqrt(double(density_[i]) / double(peak));
+                const double h = std::max(1.0, fraction * overviewHeight);
+                p.fillRect(QRectF(labelWidth + i * binWidth, overviewTop + overviewHeight - h,
+                                  std::max(1.0, binWidth), h), QColor("#B4BBC1"));
+            }
+        }
+        const double miniLeft = labelWidth + viewStart_ / fullSpan_ * overviewWidth;
+        const double miniWidth = std::max(2.0, viewSpan_ / fullSpan_ * overviewWidth);
+        p.fillRect(QRectF(miniLeft, overviewTop, miniWidth, overviewHeight),
+                   QColor(85, 130, 165, 38));
+        p.setPen(QPen(QColor("#527B9A"), 1));
+        p.drawRect(QRectF(miniLeft, overviewTop, miniWidth, overviewHeight));
+
         p.setPen(QColor("#777777"));
         p.drawText(16, 90, "thread / lifetime");
 
@@ -467,6 +543,21 @@ protected:
         }
         p.restore();
 
+        // Time range selection across all visible tracks.
+        if (rangeActive_) {
+            const double x1 = std::clamp(timeToX(std::min(rangeStart_, rangeEnd_)),
+                                         double(labelWidth), double(plotRight()));
+            const double x2 = std::clamp(timeToX(std::max(rangeStart_, rangeEnd_)),
+                                         double(labelWidth), double(plotRight()));
+            if (x2 > x1) {
+                p.fillRect(QRectF(x1, rowsTop, x2 - x1, std::max(0, bottom - rowsTop)),
+                           QColor(70, 110, 150, 27));
+                p.setPen(QPen(QColor("#507B9A"), 1));
+                p.drawLine(QPointF(x1, 73), QPointF(x1, bottom));
+                p.drawLine(QPointF(x2, 73), QPointF(x2, bottom));
+            }
+        }
+
         for (int i = offset; i < std::min<int>(rows_.size(), offset + visible); ++i) {
             const int y = rowsTop + (i - offset) * rowHeight;
             const auto& row = rows_[i];
@@ -507,6 +598,24 @@ protected:
 
     void mousePressEvent(QMouseEvent* event) override {
         if (event->button() != Qt::LeftButton || event->position().x() < labelWidth) return;
+        setFocus(Qt::MouseFocusReason);
+        if (event->position().y() >= overviewTop &&
+            event->position().y() <= overviewTop + overviewHeight) {
+            overviewDragging_ = true;
+            seekOverview(event->position().x());
+            return;
+        }
+        if ((event->modifiers() & Qt::ShiftModifier) &&
+            event->position().y() >= rowsTop &&
+            event->position().y() < height() - footerHeight) {
+            rangeDragging_ = rangeActive_ = true;
+            rangeStart_ = rangeEnd_ = xToRelative(event->position().x());
+            selectedRow_ = selectedInterval_ = -1;
+            selectedSource_.clear();
+            if (onSelectionChanged) onSelectionChanged();
+            update();
+            return;
+        }
         mouseDown_ = event->position();
         startAtMouseDown_ = viewStart_;
         dragging_ = true;
@@ -515,6 +624,15 @@ protected:
     }
 
     void mouseMoveEvent(QMouseEvent* event) override {
+        if (overviewDragging_) {
+            seekOverview(event->position().x());
+            return;
+        }
+        if (rangeDragging_) {
+            rangeEnd_ = xToRelative(event->position().x());
+            update();
+            return;
+        }
         if (dragging_) {
             const double pixels = event->position().x() - mouseDown_.x();
             if (std::abs(pixels) > 3.0) moved_ = true;
@@ -536,13 +654,27 @@ protected:
     }
 
     void mouseReleaseEvent(QMouseEvent* event) override {
-        if (event->button() != Qt::LeftButton || !dragging_) return;
+        if (event->button() != Qt::LeftButton) return;
+        if (overviewDragging_) {
+            overviewDragging_ = false;
+            return;
+        }
+        if (rangeDragging_) {
+            rangeDragging_ = false;
+            rangeEnd_ = xToRelative(event->position().x());
+            if (std::abs(rangeEnd_ - rangeStart_) < viewSpan_ * 0.002)
+                rangeActive_ = false;
+            update();
+            return;
+        }
+        if (!dragging_) return;
         dragging_ = false;
         setCursor(Qt::ArrowCursor);
         if (!moved_) {
             const auto [r, i] = hitTest(event->position());
             selectedRow_ = r;
             selectedInterval_ = i;
+            rangeActive_ = false;
             selectedSource_.clear();
             if (onSelectionChanged) onSelectionChanged();
         }
@@ -551,6 +683,12 @@ protected:
 
 private:
     std::vector<ThreadRow> rows_;
+    std::vector<std::uint32_t> density_;
+    bool overviewDragging_ = false;
+    bool rangeDragging_ = false;
+    bool rangeActive_ = false;
+    double rangeStart_ = 0;
+    double rangeEnd_ = 0;
     std::vector<schedEvent> switches_;
     std::vector<wakeEvent> waking_;
     std::vector<wakeEvent> wakeups_;
@@ -574,6 +712,20 @@ private:
     double relativeNs(std::uint64_t absolute) const {
         if (absolute >= minNs_) return static_cast<double>(absolute - minNs_);
         return -static_cast<double>(minNs_ - absolute);
+    }
+
+    double xToRelative(double x) const {
+        const double fraction = std::clamp((x - labelWidth) /
+                std::max(1.0, double(plotRight() - labelWidth)), 0.0, 1.0);
+        return std::clamp(viewStart_ + fraction * viewSpan_, 0.0, fullSpan_);
+    }
+
+    void seekOverview(double x) {
+        const double fraction = std::clamp((x - labelWidth) /
+                std::max(1.0, double(plotRight() - labelWidth)), 0.0, 1.0);
+        viewStart_ = std::clamp(fraction * fullSpan_ - viewSpan_ * 0.5, 0.0,
+                                std::max(0.0, fullSpan_ - viewSpan_));
+        update();
     }
 
     double timeToX(double relative) const {
@@ -623,6 +775,14 @@ private:
         p.fillRect(QRect(0, y, width(), footerHeight), QColor("#F5F5F5"));
         p.setPen(QColor("#D4D4D4"));
         p.drawLine(0, y, width(), y);
+        if (rangeActive_) {
+            p.setPen(QColor("#333333"));
+            const double start = std::min(rangeStart_, rangeEnd_);
+            const double end = std::max(rangeStart_, rangeEnd_);
+            p.drawText(16, y + 44, QString("Selected range   %1 – %2   ·   %3     [Z to zoom]")
+                .arg(formatTime(start)).arg(formatTime(end)).arg(formatTime(end - start)));
+            return;
+        }
         const int r = selectedRow_ >= 0 ? selectedRow_ : hoverRow_;
         const int i = selectedRow_ >= 0 ? selectedInterval_ : hoverInterval_;
         p.setPen(QColor("#333333"));
@@ -768,6 +928,33 @@ int main(int argc, char* argv[]) {
     auto* fitAction = toolbar->addAction("Fit");
     fitAction->setShortcut(QKeySequence("F"));
     QObject::connect(fitAction, &QAction::triggered, timeline, [timeline] { timeline->fit(); });
+
+    auto* findInput = new QLineEdit(toolbar);
+    findInput->setPlaceholderText("Find TID…");
+    findInput->setFixedWidth(125);
+    findInput->setClearButtonEnabled(true);
+    findInput->setStyleSheet("QLineEdit { border: 1px solid #C9C9C9; background: white; padding: 4px 6px; }");
+    toolbar->addWidget(findInput);
+    QObject::connect(findInput, &QLineEdit::returnPressed, &window, [&] {
+        if (!timeline->findThread(findInput->text()))
+            findInput->setStyleSheet("QLineEdit { border: 1px solid #B67979; background: white; padding: 4px 6px; }");
+        else
+            findInput->setStyleSheet("QLineEdit { border: 1px solid #C9C9C9; background: white; padding: 4px 6px; }");
+    });
+    auto* findShortcut = new QShortcut(QKeySequence("Ctrl+F"), &window);
+    QObject::connect(findShortcut, &QShortcut::activated, findInput, [findInput] {
+        findInput->setFocus();
+        findInput->selectAll();
+    });
+    auto* rangeZoomShortcut = new QShortcut(QKeySequence("Z"), timeline);
+    rangeZoomShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    QObject::connect(rangeZoomShortcut, &QShortcut::activated, timeline, [timeline] {
+        timeline->zoomToRange();
+    });
+    auto* clearShortcut = new QShortcut(QKeySequence("Esc"), &window);
+    QObject::connect(clearShortcut, &QShortcut::activated, timeline, [timeline] {
+        timeline->clearSelection();
+    });
 
     auto* stallsAction = toolbar->addAction("Stalls");
     QObject::connect(stallsAction, &QAction::triggered, &window, [&] {
